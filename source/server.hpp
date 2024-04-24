@@ -2,19 +2,22 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <cassert>
 #include <memory>
 #include <functional>
-#include <sys/epoll.h>
 #include <unordered_map>
+#include <thread>
+#include <mutex>
 
+#include <cassert>
 #include <cstring>
 
+#include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
 
 #include "LOG.hpp"
 
@@ -344,13 +347,17 @@ public:
     }
 };
 
-class Poller
-    // 对于文件描述符进行监控事件管理
-    class Channel
+class Poller;
+
+
+class EventLoop;
+// 对于文件描述符进行监控事件管理
+class Channel
 {
 private:
     int _fd;
-    std::shared_ptr<Poller *> _poller;
+    Poller *_poller;
+    EventLoop *_loop;
     uint32_t _events;  // 当前需要监控的事件
     uint32_t _revents; // 当前连续触发的事件
     using EventCallback = std::function<void()>;
@@ -360,7 +367,7 @@ private:
     EventCallback _close_callback; // 连接断开事件被触发的回调
     EventCallback _event_callback; // 任意时间被触发的回调
 public:
-    Channel(int fd, Poller *poller) : _fd(fd), _poller(poller), _events(0), _revents(0) {}
+    Channel(EventLoop *loop, int fd) : _fd(fd), _loop(loop), _events(0), _revents(0) {}
     int Fd() { return _fd; }
     void SetREvents(uint32_t events) { _revents = events; }; // 设置实际就绪的事件
     uint32_t Events() { return _events; }                    // 获取想要监控的事件
@@ -418,11 +425,11 @@ public:
     {
         if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
         {
-            if (_read_callback)
-                _read_callback();
             // 不管任何事件，都调用的回调函数
             if (_event_callback)
                 _event_callback();
+            if (_read_callback)
+                _read_callback();
         }
         // 有可能会释放连接的操作事件， 一次只处理一个
         if (_revents & EPOLLOUT)
@@ -453,6 +460,8 @@ public:
         //     _event_callback();
     }
 };
+
+
 
 class Poller
 {
@@ -500,13 +509,14 @@ public:
         }
     }
     // 添加或修改监控事件
-    void UpdataEvent(Channel *channel)
+    void UpdateEvent(Channel *channel)
     {
         bool ret = HasChannel(channel);
         if (!ret)
         {
             // 不存在则添加
-            Update(channel, EPOLL_CTL_ADD);
+            _channel.insert(std::make_pair(channel->Fd(), channel));
+            return Update(channel, EPOLL_CTL_ADD);
         }
         return Update(channel, EPOLL_CTL_MOD);
     }
@@ -544,11 +554,143 @@ public:
     }
 };
 
+
+
+class EventLoop
+{
+private:
+    using Functor = std::function<void()>;
+    std::thread::id _thread_id;  // 线程ID
+    int _event_fd;               // eventfd 唤醒IO事件监控有可能导致的阻塞
+    Poller _poller;              // 进行所有描述符的事件监控
+    std::vector<Functor> _tasks; // 任务池
+    std::mutex _mutex;           // 实现任务池操作的线程安全
+    std::unique_ptr<Channel> _event_channel;
+
+public:
+    // 执行任务池中的所有任务
+    void RunAllTask()
+    {
+        // 任务队列处理机制，确保多线程环境下对任务队列的安全访问和执行。
+        std::vector<Functor> functor;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _tasks.swap(functor);
+        }
+        for (auto &f : functor)
+        {
+            f();
+        }
+        return;
+    }
+
+    static int CreateEventFd()
+    {
+        int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (efd < 0)
+        {
+            ERR_LOG("CREATE EVENTFD TAILED!!");
+            abort();
+        }
+        return efd;
+    }
+    void ReadEventFd()
+    {
+        uint64_t res = 0;
+        int ret = read(_event_fd, &res, sizeof(res));
+        if (ret < 0)
+        {
+            // EINTR --- 被信号打断
+            // EAGAIN --- 无数据可读
+            if (errno == EINTR || errno == EAGAIN)
+            {
+                return;
+            }
+            ERR_LOG("READ EVENTFD FAILED!!");
+            abort();
+        }
+        return;
+    }
+    void WeakUpEventFd()
+    {
+        uint64_t val = 1;
+        int ret = write(_event_fd, &val, sizeof(val));
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+            {
+                return;
+            }
+            ERR_LOG("READ EVENTFD FAILED!!");
+            abort();
+        }
+        return;
+    }
+
+public:
+    EventLoop()
+        : _thread_id(std::this_thread::get_id()), _event_fd(CreateEventFd()), _event_channel(new Channel(this, _event_fd))
+    {
+        // 给evenfd添加可读事件回调函数，读取eventfd事件通知次数
+        _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventFd, this));
+        _event_channel->EnableRead();
+    }
+    // 三步走 -> 事件监控 --- 就绪事件处理 --- 执行任务
+    void Start()
+    {
+        // 事件监控
+        std::vector<Channel *> actives;
+        _poller.Poll(&actives);
+        // 就绪事件处理
+        for (auto &channel : actives)
+        {
+            channel->HandleEvent();
+        }
+        // 执行任务
+        RunAllTask();
+    }
+    // 用于判断当前线程是否是EventLoop对应的线程
+    bool IsInLoop()
+    {
+        return _thread_id == std::this_thread::get_id();
+    }
+    // 判断当前要执行的任务是否处于房前线程中，如果是则执行，不是则压入队列
+    void RunInLoop(const Functor &cb)
+    {
+        if (IsInLoop())
+        {
+            return cb();
+        }
+        return QueueInLoop(cb);
+    }
+    // 将操作压入线程池
+    void QueueInLoop(const Functor &cb)
+    {
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _tasks.push_back(cb);
+        }
+        // 唤醒有可能因为没有事件
+        // 其实就是给eventfd写入一个数据，eventfd就会触发可读事件
+        WeakUpEventFd();
+    }
+    // 添加/修改描述符的监控事件
+    void UpdateEvent(Channel *channel)
+    {
+        return _poller.UpdateEvent(channel);
+    }
+    // 移除描述符的监控
+    void RemoveEvent(Channel *channel)
+    {
+        return _poller.RemoveEvent(channel);
+    }
+};
+
 void Channel::Remove()
 {
-    return _poller->RemoveEvent(this);
+    return _loop->RemoveEvent(this);
 }
 void Channel::Update()
 {
-    return _poller->UpdateEvent(this);
+    return _loop->UpdateEvent(this);
 }
