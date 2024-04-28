@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <signal.h>
 
 #include "LOG.hpp"
 
@@ -1321,16 +1322,19 @@ private:
         _conns.insert(std::make_pair(_next_id, conn));
     }
 
-    void RemoveConnectionInLoop(const PtrConnection &conn) {
+    void RemoveConnectionInLoop(const PtrConnection &conn)
+    {
         int id = conn->Id();
         auto it = _conns.find(id);
-        if (it != _conns.end()) {
+        if (it != _conns.end())
+        {
             _conns.erase(it);
         }
     }
 
     // 从管理Connection的 _conns中移除连接信息
-    void RemoveConnection(const PtrConnection &conn) {
+    void RemoveConnection(const PtrConnection &conn)
+    {
         _baseloop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
     }
     void RunAfterInLoop(const Functor &task, int delay)
@@ -1343,7 +1347,7 @@ public:
     TcpServer(uint16_t port)
         : _port(port), _next_id(0), _enable_inactive_release(false), _acceptor(&_baseloop, port), _pool(&_baseloop)
     {
-        _pool.Create();     // 创建线程池中的从属线程
+        _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
         _acceptor.Listen(); // 将监听套接字挂到baseloop上开始监控事件
     }
     void SetThreadCount(int count)
@@ -1367,6 +1371,7 @@ public:
     }
     void Start()
     {
+        _pool.Create(); // 创建线程池中的从属线程
         _baseloop.Start();
     }
 };
@@ -1395,3 +1400,15 @@ void TimerWheel::TimerCancel(uint64_t id)
 {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
 }
+
+class NetWork
+{
+public:
+    NetWork()
+    {
+        DBG_LOG("SIGPIPE INT");
+        signal(SIGPIPE, SIG_IGN);
+    }
+};
+
+static NetWork nw;
