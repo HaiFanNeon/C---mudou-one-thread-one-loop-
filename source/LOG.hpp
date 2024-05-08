@@ -3,7 +3,7 @@
 #define INF 0
 #define DBG 1
 #define ERR 2
-#define LOG_LEVEL INF
+#define LOG_LEVEL ERR
 #define LOG(level, format, ...) \
     do { \
         if (level < LOG_LEVEL) break; \
